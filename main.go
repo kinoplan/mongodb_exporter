@@ -17,6 +17,8 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -49,8 +51,10 @@ type GlobalFlags struct {
 	LogLevel              string   `name:"log.level" help:"Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]" enum:"debug,info,warn,error,fatal" default:"error"`
 	ConnectTimeoutMS      int      `name:"mongodb.connect-timeout-ms" help:"Connection timeout in milliseconds" default:"5000"`
 
+	EnableExporterMetrics    bool `name:"collector.exporter-metrics" help:"Enable collecting metrics about the exporter itself (process_*, go_*)" negatable:"" default:"True"`
 	EnableDiagnosticData     bool `name:"collector.diagnosticdata" help:"Enable collecting metrics from getDiagnosticData"`
 	EnableReplicasetStatus   bool `name:"collector.replicasetstatus" help:"Enable collecting metrics from replSetGetStatus"`
+	EnableReplicasetConfig   bool `name:"collector.replicasetconfig" help:"Enable collecting metrics from replSetGetConfig"`
 	EnableDBStats            bool `name:"collector.dbstats" help:"Enable collecting metrics from dbStats"`
 	EnableDBStatsFreeStorage bool `name:"collector.dbstatsfreestorage" help:"Enable collecting free space metrics from dbStats"`
 	EnableTopMetrics         bool `name:"collector.topmetrics" help:"Enable collecting metrics from top admin command"`
@@ -58,13 +62,16 @@ type GlobalFlags struct {
 	EnableIndexStats         bool `name:"collector.indexstats" help:"Enable collecting metrics from $indexStats"`
 	EnableCollStats          bool `name:"collector.collstats" help:"Enable collecting metrics from $collStats"`
 	EnableProfile            bool `name:"collector.profile" help:"Enable collecting metrics from profile"`
+	EnableFCV                bool `name:"collector.fcv" help:"Enable Feature Compatibility Version collector"`
 	EnableShards             bool `help:"Enable collecting metrics from sharded Mongo clusters about chunks" name:"collector.shards"`
+	EnablePBM                bool `help:"Enable collecting metrics from Percona Backup for MongoDB" name:"collector.pbm"`
 
 	EnableOverrideDescendingIndex bool `name:"metrics.overridedescendingindex" help:"Enable descending index name override to replace -1 with _DESC"`
 
 	CollectAll bool `name:"collect-all" help:"Enable all collectors. Same as specifying all --collector.<name>"`
 
-	CollStatsLimit int `name:"collector.collstats-limit" help:"Disable collstats, dbstats, topmetrics and indexstats collector if there are more than <n> collections. 0=No limit" default:"0"`
+	CollStatsLimit         int  `name:"collector.collstats-limit" help:"Disable collstats, dbstats, topmetrics and indexstats collector if there are more than <n> collections. 0=No limit" default:"0"`
+	CollStatsEnableDetails bool `name:"collector.collstats-enable-details" help:"Enable collecting index details and wired tiger metrics from $collStats" default:"false"`
 
 	ProfileTimeTS int `name:"collector.profile-time-ts" help:"Set time for scrape slow queries." default:"30"`
 
@@ -73,6 +80,7 @@ type GlobalFlags struct {
 	DiscoveringMode bool `name:"discovering-mode" help:"Enable autodiscover collections" negatable:""`
 	CompatibleMode  bool `name:"compatible-mode" help:"Enable old mongodb-exporter compatible metrics" negatable:""`
 	Version         bool `name:"version" help:"Show version and exit"`
+	SplitCluster    bool `name:"split-cluster" help:"Treat each node in cluster as a separate target" negatable:"" default:"false"`
 }
 
 func main() {
@@ -123,10 +131,11 @@ func main() {
 	}
 
 	serverOpts := &exporter.ServerOpts{
-		Path:             opts.WebTelemetryPath,
-		MultiTargetPath:  "/scrape",
-		WebListenAddress: opts.WebListenAddress,
-		TLSConfigPath:    opts.TLSConfigPath,
+		Path:              opts.WebTelemetryPath,
+		MultiTargetPath:   "/scrape",
+		OverallTargetPath: "/scrapeall",
+		WebListenAddress:  opts.WebListenAddress,
+		TLSConfigPath:     opts.TLSConfigPath,
 	}
 	exporter.RunWebServer(serverOpts, buildServers(opts, log), log)
 }
@@ -135,20 +144,42 @@ func buildExporter(opts GlobalFlags, uri string, log *logrus.Logger) *exporter.E
 	uri = buildURI(uri, opts.User, opts.Password)
 	log.Debugf("Connection URI: %s", uri)
 
+	uriParsed, _ := url.Parse(uri)
+	var nodeName string
+	switch {
+	case uriParsed == nil:
+		nodeName = ""
+	case uriParsed.Port() != "":
+		nodeName = net.JoinHostPort(uriParsed.Hostname(), uriParsed.Port())
+	default:
+		nodeName = uriParsed.Host
+	}
+
+	collStatsNamespaces := []string{}
+	if opts.CollStatsNamespaces != "" {
+		collStatsNamespaces = strings.Split(opts.CollStatsNamespaces, ",")
+	}
+	indexStatsCollections := []string{}
+	if opts.IndexStatsCollections != "" {
+		indexStatsCollections = strings.Split(opts.IndexStatsCollections, ",")
+	}
 	exporterOpts := &exporter.Opts{
-		CollStatsNamespaces:   strings.Split(opts.CollStatsNamespaces, ","),
+		CollStatsNamespaces:   collStatsNamespaces,
 		CompatibleMode:        opts.CompatibleMode,
 		DiscoveringMode:       opts.DiscoveringMode,
-		IndexStatsCollections: strings.Split(opts.IndexStatsCollections, ","),
+		IndexStatsCollections: indexStatsCollections,
 		Logger:                log,
 		URI:                   uri,
+		NodeName:              nodeName,
 		GlobalConnPool:        opts.GlobalConnPool,
 		DirectConnect:         opts.DirectConnect,
 		ConnectTimeoutMS:      opts.ConnectTimeoutMS,
 		TimeoutOffset:         opts.TimeoutOffset,
 
+		DisableDefaultRegistry:   !opts.EnableExporterMetrics,
 		EnableDiagnosticData:     opts.EnableDiagnosticData,
 		EnableReplicasetStatus:   opts.EnableReplicasetStatus,
+		EnableReplicasetConfig:   opts.EnableReplicasetConfig,
 		EnableCurrentopMetrics:   opts.EnableCurrentopMetrics,
 		EnableTopMetrics:         opts.EnableTopMetrics,
 		EnableDBStats:            opts.EnableDBStats,
@@ -157,13 +188,16 @@ func buildExporter(opts GlobalFlags, uri string, log *logrus.Logger) *exporter.E
 		EnableCollStats:          opts.EnableCollStats,
 		EnableProfile:            opts.EnableProfile,
 		EnableShards:             opts.EnableShards,
+		EnableFCV:                opts.EnableFCV,
+		EnablePBMMetrics:         opts.EnablePBM,
 
 		EnableOverrideDescendingIndex: opts.EnableOverrideDescendingIndex,
 
-		CollStatsLimit:    opts.CollStatsLimit,
-		CollectAll:        opts.CollectAll,
-		ProfileTimeTS:     opts.ProfileTimeTS,
-		CurrentOpSlowTime: opts.CurrentOpSlowTime,
+		CollStatsLimit:         opts.CollStatsLimit,
+		CollStatsEnableDetails: opts.CollStatsEnableDetails,
+		CollectAll:             opts.CollectAll,
+		ProfileTimeTS:          opts.ProfileTimeTS,
+		CurrentOpSlowTime:      opts.CurrentOpSlowTime,
 	}
 
 	e := exporter.New(exporterOpts)
@@ -171,34 +205,47 @@ func buildExporter(opts GlobalFlags, uri string, log *logrus.Logger) *exporter.E
 	return e
 }
 
-func buildServers(opts GlobalFlags, log *logrus.Logger) []*exporter.Exporter {
-	URIs := parseURIList(opts.URI)
+func buildServers(opts GlobalFlags, logger *logrus.Logger) []*exporter.Exporter {
+	URIs := parseURIList(opts.URI, logger, opts.SplitCluster)
 	servers := make([]*exporter.Exporter, len(URIs))
 	for serverIdx := range URIs {
-		servers[serverIdx] = buildExporter(opts, URIs[serverIdx], log)
+		servers[serverIdx] = buildExporter(opts, URIs[serverIdx], logger)
 	}
 
 	return servers
 }
 
-func parseURIList(uriList []string) []string {
+func parseURIList(uriList []string, logger *logrus.Logger, splitCluster bool) []string {
 	var URIs []string
 
-	// If server URI is prefixed with mongodb, then every next URI in line not prefixed with mongodb is a part of cluster
-	// Otherwise treat it as a standalone server
+	// If server URI is prefixed with mongodb scheme string, then every next URI in
+	// line not prefixed with mongodb scheme string is a part of cluster. Otherwise
+	// treat it as a standalone server
 	realURI := ""
 	matchRegexp := regexp.MustCompile(`^mongodb(\+srv)?://`)
 	for _, URI := range uriList {
-		if matchRegexp.MatchString(URI) {
+		matches := matchRegexp.FindStringSubmatch(URI)
+		if matches != nil {
 			if realURI != "" {
+				// Add the previous host buffer to the url list as we met the scheme part
 				URIs = append(URIs, realURI)
+				realURI = ""
 			}
-			realURI = URI
+			if matches[1] == "" {
+				realURI = URI
+			} else {
+				// There can be only one host in SRV connection string
+				if splitCluster {
+					// In splitCluster mode we get srv connection string from SRV recors
+					URI = exporter.GetSeedListFromSRV(URI, logger)
+				}
+				URIs = append(URIs, URI)
+			}
 		} else {
 			if realURI == "" {
 				URIs = append(URIs, "mongodb://"+URI)
 			} else {
-				realURI = realURI + "," + URI
+				realURI += "," + URI
 			}
 		}
 	}
@@ -206,19 +253,39 @@ func parseURIList(uriList []string) []string {
 		URIs = append(URIs, realURI)
 	}
 
+	if splitCluster {
+		// In this mode we split cluster strings into separate targets
+		separateURIs := []string{}
+		for _, hosturl := range URIs {
+			urlParsed, err := url.Parse(hosturl)
+			if err != nil {
+				logger.Fatal(fmt.Sprintf("Failed to parse URI %s: %v", hosturl, err))
+			}
+			for _, host := range strings.Split(urlParsed.Host, ",") {
+				targetURI := "mongodb://"
+				if urlParsed.User != nil {
+					targetURI += urlParsed.User.String() + "@"
+				}
+				targetURI += host
+				if urlParsed.Path != "" {
+					targetURI += urlParsed.Path
+				}
+				if urlParsed.RawQuery != "" {
+					targetURI += "?" + urlParsed.RawQuery
+				}
+				separateURIs = append(separateURIs, targetURI)
+			}
+		}
+		return separateURIs
+	}
 	return URIs
 }
 
-func buildURI(uri string, user string, password string) string {
-	prefix := "mongodb://" // default prefix
-	matchRegexp := regexp.MustCompile(`^mongodb(\+srv)?://`)
-
-	// Split the uri prefix if there is any
-	if matchRegexp.MatchString(uri) {
-		uriArray := strings.SplitN(uri, "://", 2)
-		prefix = uriArray[0] + "://"
-		uri = uriArray[1]
-	}
+// buildURIManually builds the URI manually by checking if the user and password are supplied
+func buildURIManually(uri string, user string, password string) string {
+	uriArray := strings.SplitN(uri, "://", 2) //nolint:mnd
+	prefix := uriArray[0] + "://"
+	uri = uriArray[1]
 
 	// IF user@pass not contained in uri AND custom user and pass supplied in arguments
 	// DO concat a new uri with user and pass arguments value
@@ -231,4 +298,24 @@ func buildURI(uri string, user string, password string) string {
 	uri = prefix + uri
 
 	return uri
+}
+
+func buildURI(uri string, user string, password string) string {
+	defaultPrefix := "mongodb://" // default prefix
+
+	if !strings.HasPrefix(uri, defaultPrefix) && !strings.HasPrefix(uri, "mongodb+srv://") {
+		uri = defaultPrefix + uri
+	}
+	parsedURI, err := url.Parse(uri)
+	if err != nil {
+		// PMM generates URI with escaped path to socket file, so url.Parse fails
+		// in this case we build URI manually
+		return buildURIManually(uri, user, password)
+	}
+
+	if parsedURI.User == nil && user != "" && password != "" {
+		parsedURI.User = url.UserPassword(user, password)
+	}
+
+	return parsedURI.String()
 }

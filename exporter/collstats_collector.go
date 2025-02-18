@@ -31,22 +31,24 @@ type collstatsCollector struct {
 
 	compatibleMode  bool
 	discoveringMode bool
+	enableDetails   bool
 	topologyInfo    labelsGetter
 
 	collections []string
 }
 
 // newCollectionStatsCollector creates a collector for statistics about collections.
-func newCollectionStatsCollector(ctx context.Context, client *mongo.Client, logger *logrus.Logger, compatible, discovery bool, topology labelsGetter, collections []string) *collstatsCollector {
+func newCollectionStatsCollector(ctx context.Context, client *mongo.Client, logger *logrus.Logger, discovery bool, topology labelsGetter, collections []string, enableDetails bool) *collstatsCollector {
 	return &collstatsCollector{
 		ctx:  ctx,
 		base: newBaseCollector(client, logger.WithFields(logrus.Fields{"collector": "collstats"})),
 
-		compatibleMode:  compatible,
+		compatibleMode:  false, // there are no compatible metrics for this collector.
 		discoveringMode: discovery,
 		topologyInfo:    topology,
 
-		collections: collections,
+		collections:   collections,
+		enableDetails: enableDetails,
 	}
 }
 
@@ -92,25 +94,37 @@ func (d *collstatsCollector) collect(ch chan<- prometheus.Metric) {
 		database := parts[0]
 		collection := strings.Join(parts[1:], ".") // support collections having a .
 
+		// exclude system collections
+		if strings.HasPrefix(collection, "system.") {
+			continue
+		}
+
 		aggregation := bson.D{
 			{
-				Key: "$collStats", Value: bson.M{
+				Key: "$collStats",
+				Value: bson.M{
 					// TODO: PMM-9568 : Add support to handle histogram metrics
 					"latencyStats": bson.M{"histograms": false},
 					"storageStats": bson.M{"scale": 1},
 				},
 			},
 		}
-		project := bson.D{
-			{
-				Key: "$project", Value: bson.M{
-					"storageStats.wiredTiger":   0,
-					"storageStats.indexDetails": 0,
+
+		pipeline := mongo.Pipeline{aggregation}
+
+		if !d.enableDetails {
+			project := bson.D{
+				{
+					Key: "$project", Value: bson.M{
+						"storageStats.wiredTiger":   0,
+						"storageStats.indexDetails": 0,
+					},
 				},
-			},
+			}
+			pipeline = append(pipeline, project)
 		}
 
-		cursor, err := client.Database(database).Collection(collection).Aggregate(d.ctx, mongo.Pipeline{aggregation, project})
+		cursor, err := client.Database(database).Collection(collection).Aggregate(d.ctx, pipeline)
 		if err != nil {
 			logger.Errorf("cannot get $collstats cursor for collection %s.%s: %s", database, collection, err)
 
@@ -133,6 +147,10 @@ func (d *collstatsCollector) collect(ch chan<- prometheus.Metric) {
 		labels["collection"] = collection
 
 		for _, metrics := range stats {
+			if shard, ok := metrics["shard"].(string); ok {
+				labels["shard"] = shard
+			}
+
 			for _, metric := range makeMetrics(prefix, metrics, labels, d.compatibleMode) {
 				ch <- metric
 			}

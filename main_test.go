@@ -16,25 +16,86 @@
 package main
 
 import (
+	"net"
 	"strings"
 	"testing"
 
+	"github.com/foxcpp/go-mockdns"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/percona/mongodb_exporter/internal/tu"
 )
 
 func TestParseURIList(t *testing.T) {
 	t.Parallel()
 	tests := map[string][]string{
 		"mongodb://server": {"mongodb://server"},
-		"mongodb+srv://server1,server2,mongodb://server3,server4,server5": {"mongodb+srv://server1,server2", "mongodb://server3,server4,server5"},
-		"server1":                 {"mongodb://server1"},
-		"server1,server2,server3": {"mongodb://server1", "mongodb://server2", "mongodb://server3"},
-		"mongodb.server,server2":  {"mongodb://mongodb.server", "mongodb://server2"},
-		"standalone,mongodb://server1,server2,mongodb+srv://server3,server4,mongodb://server5": {"mongodb://standalone", "mongodb://server1,server2", "mongodb+srv://server3,server4", "mongodb://server5"},
+		"mongodb+srv://server1,server2,mongodb://server3,server4,server5": {
+			"mongodb+srv://server1",
+			"mongodb://server2",
+			"mongodb://server3,server4,server5",
+		},
+		"server1": {"mongodb://server1"},
+		"server1,server2,server3": {
+			"mongodb://server1",
+			"mongodb://server2",
+			"mongodb://server3",
+		},
+		"mongodb.server,server2": {
+			"mongodb://mongodb.server",
+			"mongodb://server2",
+		},
+		"standalone,mongodb://server1,server2,mongodb+srv://server3,server4,mongodb://server5": {
+			"mongodb://standalone",
+			"mongodb://server1,server2",
+			"mongodb+srv://server3",
+			"mongodb://server4",
+			"mongodb://server5",
+		},
 	}
+	logger := logrus.New()
 	for test, expected := range tests {
-		actual := parseURIList(strings.Split(test, ","))
+		actual := parseURIList(strings.Split(test, ","), logger, false)
+		assert.Equal(t, expected, actual)
+	}
+}
+
+func TestSplitCluster(t *testing.T) {
+	// Can't run in parallel because it patches the net.DefaultResolver
+
+	tests := map[string][]string{
+		"mongodb://server": {"mongodb://server"},
+		"mongodb://user:pass@server1,server2/admin?replicaSet=rs1,mongodb://server3,server4,server5": {
+			"mongodb://user:pass@server1/admin?replicaSet=rs1",
+			"mongodb://user:pass@server2/admin?replicaSet=rs1",
+			"mongodb://server3",
+			"mongodb://server4",
+			"mongodb://server5",
+		},
+		"mongodb://server1,mongodb://user:pass@server2,server3?arg=1&arg2=2,mongodb+srv://user:pass@server.example.com/db?replicaSet=rs1": {
+			"mongodb://server1",
+			"mongodb://user:pass@server2?arg=1&arg2=2",
+			"mongodb://user:pass@server3?arg=1&arg2=2",
+			"mongodb://user:pass@mongo1.example.com:17001/db?authSource=admin&replicaSet=rs1",
+			"mongodb://user:pass@mongo2.example.com:17002/db?authSource=admin&replicaSet=rs1",
+			"mongodb://user:pass@mongo3.example.com:17003/db?authSource=admin&replicaSet=rs1",
+		},
+	}
+
+	logger := logrus.New()
+
+	srv := tu.SetupFakeResolver()
+
+	defer func(t *testing.T) {
+		t.Helper()
+		err := srv.Close()
+		assert.NoError(t, err)
+	}(t)
+	defer mockdns.UnpatchNet(net.DefaultResolver)
+
+	for test, expected := range tests {
+		actual := parseURIList(strings.Split(test, ","), logger, true)
 		assert.Equal(t, expected, actual)
 	}
 }
@@ -51,6 +112,7 @@ func TestBuildExporter(t *testing.T) {
 
 		EnableDiagnosticData:   true,
 		EnableReplicasetStatus: true,
+		EnableReplicasetConfig: true,
 
 		CompatibleMode: true,
 	}
@@ -158,12 +220,60 @@ func TestBuildURI(t *testing.T) {
 			newPassword: "",
 			expect:      "mongodb+srv://xxx:zzz@127.0.0.1",
 		},
+		{
+			situation:   "url with special characters in username and password",
+			origin:      "mongodb://127.0.0.1",
+			newUser:     "xxx?!#$%^&*()_+",
+			newPassword: "yyy?!#$%^&*()_+",
+			expect:      "mongodb://xxx%3F%21%23$%25%5E&%2A%28%29_+:yyy%3F%21%23$%25%5E&%2A%28%29_+@127.0.0.1",
+		},
+		{
+			situation:   "path to socket",
+			origin:      "mongodb:///tmp/mongodb-27017.sock",
+			newUser:     "",
+			newPassword: "",
+			expect:      "mongodb:///tmp/mongodb-27017.sock",
+		},
+		{
+			situation:   "path to socket with params",
+			origin:      "mongodb://username:s3cur3%20p%40$$w0r4.@%2Fvar%2Frun%2Fmongodb%2Fmongodb.sock/database?connectTimeoutMS=1000&directConnection=true&serverSelectionTimeoutMS=1000",
+			newUser:     "",
+			newPassword: "",
+			expect:      "mongodb://username:s3cur3%20p%40$$w0r4.@%2Fvar%2Frun%2Fmongodb%2Fmongodb.sock/database?connectTimeoutMS=1000&directConnection=true&serverSelectionTimeoutMS=1000",
+		},
+		{
+			situation:   "path to socket with auth",
+			origin:      "mongodb://xxx:yyy@/tmp/mongodb-27017.sock",
+			newUser:     "",
+			newPassword: "",
+			expect:      "mongodb://xxx:yyy@/tmp/mongodb-27017.sock",
+		},
+		{
+			situation:   "path to socket with auth and user params",
+			origin:      "mongodb:///tmp/mongodb-27017.sock",
+			newUser:     "xxx",
+			newPassword: "yyy",
+			expect:      "mongodb://xxx:yyy@/tmp/mongodb-27017.sock",
+		},
+		{
+			situation:   "path to socket without prefix",
+			origin:      "/tmp/mongodb-27017.sock",
+			newUser:     "",
+			newPassword: "",
+			expect:      "mongodb:///tmp/mongodb-27017.sock",
+		},
+		{
+			situation:   "path to socket without prefix with auth",
+			origin:      "/tmp/mongodb-27017.sock",
+			newUser:     "xxx",
+			newPassword: "yyy",
+			expect:      "mongodb://xxx:yyy@/tmp/mongodb-27017.sock",
+		},
 	}
 	for _, tc := range tests {
-		newUri := buildURI(tc.origin, tc.newUser, tc.newPassword)
-		// t.Logf("Origin: %s", tc.origin)
-		// t.Logf("Expect: %s", tc.expect)
-		// t.Logf("Result: %s", newUri)
-		assert.Equal(t, newUri, tc.expect)
+		t.Run(tc.situation, func(t *testing.T) {
+			newURI := buildURI(tc.origin, tc.newUser, tc.newPassword)
+			assert.Equal(t, tc.expect, newURI)
+		})
 	}
 }

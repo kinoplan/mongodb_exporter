@@ -20,6 +20,7 @@ arbiter=`getent hosts ${ARBITER} | awk '{ print $1 }'`
 
 username=${MONGO_INITDB_ROOT_USERNAME}
 password=${MONGO_INITDB_ROOT_PASSWORD}
+backups_dir=${PBM_BACKUPS_DIR}
 
 port=${PORT:-27017}
 
@@ -45,7 +46,8 @@ function cnf_servers() {
         "members": [
             {
                 "_id": 0,
-                "host": "${mongodb1}:${port}"
+                "host": "${mongodb1}:${port}",
+                "priority": 1000
             },
             {
                 "_id": 1,
@@ -76,7 +78,8 @@ function general_servers() {
         "members": [
             {
                 "_id": 0,
-                "host": "${mongodb1}:${port}"
+                "host": "${mongodb1}:${port}",
+                "priority": 1000
             },
             {
                 "_id": 1,
@@ -96,6 +99,7 @@ function general_servers() {
     rs.initiate(cfg);
 EOF
 }
+
 
 case $1 in
     cnf_servers)
